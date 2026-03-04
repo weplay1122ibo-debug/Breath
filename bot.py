@@ -6,32 +6,31 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import asyncpg
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+from aiogram.utils import executor
 
-# ────────── CONFIG ──────────
+# ───── CONFIG ─────
 API_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # https://your-app-name.up.railway.app
+
 ADMIN_ID = 7717061636
 TRAINER_IDS = []
-SAUDI_TZ = ZoneInfo("Asia/Riyadh")
 
+SAUDI_TZ = ZoneInfo("Asia/Riyadh")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
 db_pool = None
 user_temp = {}
 
-# ────────── GAME HANDS ──────────
+# ───── Game hands ─────
 LEFT_HANDS = ["none", "sequence_same", "pair", "AA"]
 LEFT_HANDS_LABELS = {
     "none": "❌ لا شيء",
@@ -49,49 +48,38 @@ RIGHT_HANDS_LABELS = {
     "four": "🂡 أربعة"
 }
 
-# ────────── DATABASE ──────────
+# ───── DATABASE ─────
 async def init_db():
     global db_pool
-    for attempt in range(5):
-        try:
-            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-            break
-        except asyncpg.exceptions.InternalServerError as e:
-            logger.warning(f"DB connection failed, retrying... {e}")
-            await asyncio.sleep(2)
-    else:
-        raise RuntimeError("Cannot connect to the database after 5 attempts")
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
 
     async with db_pool.acquire() as conn:
-        # training table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS training (
-                id          SERIAL PRIMARY KEY,
-                side        TEXT NOT NULL,
-                rank        TEXT,
-                suit        TEXT,
-                prev        TEXT,
-                result      TEXT,
-                minute      INTEGER,
-                created_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                id SERIAL PRIMARY KEY,
+                side TEXT,
+                rank TEXT,
+                suit TEXT,
+                prev TEXT,
+                result TEXT,
+                minute INTEGER,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             )
         """)
-        # users table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
-                expire  TIMESTAMP WITH TIME ZONE,
-                plan    TEXT
+                expire TIMESTAMP WITH TIME ZONE,
+                plan TEXT
             )
         """)
-        # codes table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS codes (
-                code    TEXT PRIMARY KEY,
-                days    INTEGER,
-                plan    TEXT,
-                used    BOOLEAN DEFAULT FALSE,
-                type    TEXT DEFAULT 'user'
+                code TEXT PRIMARY KEY,
+                days INTEGER,
+                plan TEXT,
+                used BOOLEAN DEFAULT FALSE,
+                type TEXT DEFAULT 'user'
             )
         """)
 
@@ -102,20 +90,18 @@ async def check_subscription(user_id: int) -> bool:
         row = await conn.fetchrow("SELECT expire FROM users WHERE user_id=$1", str(user_id))
         return row is not None and row["expire"] > datetime.now(tz=SAUDI_TZ)
 
-async def activate_user(user_id: int, days: int, plan: str, user_type: str="user"):
+async def activate_user(user_id: int, days: int, plan: str, user_type: str = "user"):
     expire = datetime.now(tz=SAUDI_TZ) + timedelta(days=days)
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO users (user_id, expire, plan)
-            VALUES ($1,$2,$3)
-            ON CONFLICT (user_id) DO UPDATE
-                SET expire = EXCLUDED.expire,
-                    plan = EXCLUDED.plan
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE SET expire=EXCLUDED.expire, plan=EXCLUDED.plan
         """, str(user_id), expire, plan)
-    if user_type=="trainer" and user_id not in TRAINER_IDS:
+    if user_type == "trainer" and user_id not in TRAINER_IDS:
         TRAINER_IDS.append(user_id)
 
-# ────────── AI / Prediction ──────────
+# ───── AI / Prediction ─────
 async def train_ai(side: str, rank: str, suit: str, prev: str, result: str):
     minute = datetime.now(tz=SAUDI_TZ).minute
     async with db_pool.acquire() as conn:
@@ -124,74 +110,66 @@ async def train_ai(side: str, rank: str, suit: str, prev: str, result: str):
             VALUES ($1,$2,$3,$4,$5,$6)
         """, side, rank, suit, prev, result, minute)
 
-async def predict_hand(side: str, rank: str, suit: str, prev: str, hands_list: list[str]) -> tuple[str,int]:
-    scores = {h:0 for h in hands_list}
+async def predict_hand(side: str, rank: str, suit: str, prev: str, hands_list: list[str]):
+    scores = {h: 0 for h in hands_list}
     total = 0
     current_minute = datetime.now(tz=SAUDI_TZ).minute
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT rank,suit,prev,result,minute FROM training WHERE side=$1", side)
+        rows = await conn.fetch("SELECT rank, suit, prev, result, minute FROM training WHERE side=$1", side)
     for row in rows:
         weight = 0
-        if row["rank"]==rank: weight+=3
-        if row["suit"]==suit: weight+=3
-        if row["prev"]==prev: weight+=5
-        if row["minute"]==current_minute and row["result"] in ("AA","four","pair"): weight+=5
-        if weight>0:
+        if row["rank"] == rank: weight += 3
+        if row["suit"] == suit: weight += 3
+        if row["prev"] == prev: weight += 5
+        if row["minute"] == current_minute and row["result"] in ("AA","four","pair"): weight += 5
+        if weight > 0:
             for res in str(row["result"]).split(","):
-                res=res.strip()
+                res = res.strip()
                 if res in scores:
-                    scores[res]+=weight
-                    total+=weight
-    if total==0:
-        best=random.choice(hands_list)
-        confidence=random.randint(30,60)
+                    scores[res] += weight
+                    total += weight
+    if total == 0:
+        best = random.choice(hands_list)
+        confidence = random.randint(30,60)
         return best, confidence
-    probabilities={h:scores[h]/total for h in hands_list}
-    rand_val=random.random()
-    cumulative=0.0
-    best=None
+    probabilities = {h: scores[h]/total for h in hands_list}
+    rand_val = random.random()
+    cumulative = 0.0
+    best = None
     for h,p in probabilities.items():
-        cumulative+=p
-        if rand_val<=cumulative:
-            best=h
+        cumulative += p
+        if rand_val <= cumulative:
+            best = h
             break
     if random.random()<0.1: best=random.choice(hands_list)
-    confidence=int(probabilities.get(best,0)*100)
-    confidence=max(10,min(100,confidence+random.randint(-5,5)))
-    return best,confidence
+    confidence = int(probabilities.get(best,0)*100)
+    confidence = max(10,min(100,confidence+random.randint(-5,5)))
+    return best, confidence
 
-# ────────── Keyboards ──────────
-def ranks_kb() -> InlineKeyboardMarkup:
+# ───── Keyboards ─────
+def ranks_kb(): 
     ranks=["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
     rows=[ranks[i:i+4] for i in range(0,len(ranks),4)]
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=r,callback_data=f"rank_{r}") for r in row] for row in rows
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r,callback_data=f"rank_{r}") for r in row] for row in rows])
 
-def suits_kb() -> InlineKeyboardMarkup:
+def suits_kb():
     suits=["♥️","♦️","♣️","♠️"]
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=s,callback_data=f"suit_{s}") for s in suits]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=s,callback_data=f"suit_{s}") for s in suits]])
 
-def prev_hands_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=RIGHT_HANDS_LABELS[h], callback_data=f"prev_{h}")] for h in RIGHT_HANDS
-    ])
+def prev_hands_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=RIGHT_HANDS_LABELS[h],callback_data=f"prev_{h}")] for h in RIGHT_HANDS])
 
-def next_guess_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 التخمين التالي", callback_data="next_guess")]
-    ])
+def next_guess_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 التخمين التالي",callback_data="next_guess")]])
 
-# ────────── Handlers ──────────
+# ───── Handlers ─────
 @dp.message(CommandStart())
 async def start(message: Message):
     if not await check_subscription(message.from_user.id):
         await message.answer("❌ لازم تدخل كود اشتراك\n<code>/code XXXXX</code>")
         return
-    mode=user_temp.get(message.from_user.id,{}).get("mode","guess_only")
-    text="🧠 وضع التدريب مفعل" if mode=="training" else "🎲 التخمين العادي"
+    mode = user_temp.get(message.from_user.id, {}).get("mode","guess_only")
+    text = "🧠 وضع التدريب مفعل" if mode=="training" else "🎲 التخمين العادي"
     await message.answer(text,reply_markup=ranks_kb())
 
 @dp.message(Command("code"))
@@ -202,7 +180,7 @@ async def use_code(message: Message):
         return
     code=parts[1].upper()
     async with db_pool.acquire() as conn:
-        row=await conn.fetchrow("SELECT days,plan,type,used FROM codes WHERE code=$1", code)
+        row=await conn.fetchrow("SELECT days, plan, type, used FROM codes WHERE code=$1", code)
         if not row or row["used"]:
             await message.answer("❌ كود غير صالح أو مستخدم")
             return
@@ -215,21 +193,20 @@ async def use_code(message: Message):
 
 @dp.message(Command("admin"))
 async def admin_guess_mode(message: Message):
-    parts=message.text.split()
-    uid=message.from_user.id
+    parts = message.text.split()
+    uid = message.from_user.id
     if uid not in [ADMIN_ID]+TRAINER_IDS: return
     if len(parts)==2 and parts[1].lower()=="king":
         user_temp[uid]={"mode":"guess_only"}
-        await message.answer("🎲 وضع التخمين مفعل. اختر رقم الورقة:", reply_markup=ranks_kb())
-    else:
-        await message.answer("صيغة غير صحيحة")
+        await message.answer("🎲 وضع التخمين مفعل. اختر رقم الورقة:",reply_markup=ranks_kb())
+    else: await message.answer("صيغة غير صحيحة")
 
 @dp.message(Command("train"))
 async def admin_train_mode(message: Message):
-    uid=message.from_user.id
+    uid = message.from_user.id
     if uid not in [ADMIN_ID]+TRAINER_IDS: return
     user_temp[uid]={"mode":"training"}
-    await message.answer("🧠 وضع التدريب مفعل. اختر رقم الورقة:", reply_markup=ranks_kb())
+    await message.answer("🧠 وضع التدريب مفعل. اختر رقم الورقة:",reply_markup=ranks_kb())
 
 @dp.callback_query(lambda c:c.data.startswith("rank_"))
 async def choose_rank(callback: CallbackQuery):
@@ -237,14 +214,14 @@ async def choose_rank(callback: CallbackQuery):
     uid=callback.from_user.id
     if uid not in user_temp: user_temp[uid]={}
     user_temp[uid]["rank"]=callback.data.split("_",1)[1]
-    await callback.message.edit_text("اختر النوع:", reply_markup=suits_kb())
+    await callback.message.edit_text("اختر النوع:",reply_markup=suits_kb())
 
 @dp.callback_query(lambda c:c.data.startswith("suit_"))
 async def choose_suit(callback: CallbackQuery):
     await callback.answer()
     uid=callback.from_user.id
     user_temp[uid]["suit"]=callback.data.split("_",1)[1]
-    await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_hands_kb())
+    await callback.message.edit_text("اختر الضربة السابقة:",reply_markup=prev_hands_kb())
 
 @dp.callback_query(lambda c:c.data.startswith("prev_"))
 async def handle_prev(callback: CallbackQuery):
@@ -262,7 +239,10 @@ async def handle_prev(callback: CallbackQuery):
     if mode=="training":
         await train_ai("left",data["rank"],data["suit"],prev,left_pred)
         await train_ai("right",data["rank"],data["suit"],prev,right_pred)
-    text=f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)"
+    text=(
+        f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n"
+        f"➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)"
+    )
     await callback.message.edit_text(text,reply_markup=next_guess_kb())
 
 @dp.callback_query(lambda c:c.data=="next_guess")
@@ -271,22 +251,7 @@ async def next_guess(callback: CallbackQuery):
     user_temp.pop(callback.from_user.id,None)
     await callback.message.edit_text("ابدأ التخمين الجديد:",reply_markup=ranks_kb())
 
-# ────────── Webhook & Main ──────────
-async def main():
-    await init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
-    app=web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp)
-    port=int(os.getenv("PORT",8080))
-    runner=web.AppRunner(app)
-    await runner.setup()
-    site=web.TCPSite(runner,"0.0.0.0",port)
-    await site.start()
-    full_webhook_url=f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-    await bot.set_webhook(full_webhook_url)
-    logger.info("Webhook set to: %s",full_webhook_url)
-    await asyncio.Event().wait()
-
+# ───── MAIN ─────
 if __name__=="__main__":
-    asyncio.run(main())
+    asyncio.run(init_db())
+    executor.start_polling(dp, skip_updates=True)
