@@ -1,175 +1,231 @@
-import os
 import asyncio
+import logging
+import os
+import random
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import asyncpg
-import pytz
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, Command
 
-# ================= CONFIG =================
+# ────────────────────────────────────────────────
+# CONFIG
+# ────────────────────────────────────────────────
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Riyadh")
 
-bot = Bot(token=BOT_TOKEN)
+ADMIN_ID = 7717061636
+TRAINER_IDS = []
+
+SAUDI_TZ = ZoneInfo("Asia/Riyadh")
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
+
 db_pool = None
-user_state = {}
+user_temp = {}
 
-HANDS_LEFT = ["لاشيء", "زوج", "متتالية", "AA"]
-HANDS_RIGHT = ["زوجين", "متتالية", "ثلاثة", "فل هاوس", "أربعة"]
+# ────────────────────────────────────────────────
+# HANDS
+# ────────────────────────────────────────────────
 
-# ================= DATABASE =================
+LEFT_HANDS = ["none", "sequence_same", "pair", "AA"]
+LEFT_LABELS = {
+    "none": "❌ لا شيء",
+    "sequence_same": "♠️ متتالية نفس النوع",
+    "pair": "👥 زوج",
+    "AA": "🅰️ AA"
+}
+
+RIGHT_HANDS = ["two_pairs", "sequence", "three", "full_house", "four"]
+RIGHT_LABELS = {
+    "two_pairs": "👥 زوجين",
+    "sequence": "🔗 متتالية",
+    "three": "🎴 ثلاثة",
+    "full_house": "🏠 فل هاوس",
+    "four": "🂡 أربعة"
+}
+
+# ────────────────────────────────────────────────
+# DATABASE
+# ────────────────────────────────────────────────
 
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL)
+
     async with db_pool.acquire() as conn:
         await conn.execute("""
-        CREATE TABLE IF NOT EXISTS training (
-            id SERIAL PRIMARY KEY,
-            side TEXT,
-            rank TEXT,
-            suit TEXT,
-            prev TEXT,
-            minute INTEGER,
-            result TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
+            CREATE TABLE IF NOT EXISTS training (
+                id SERIAL PRIMARY KEY,
+                side TEXT,
+                rank TEXT,
+                suit TEXT,
+                prev TEXT,
+                result TEXT,
+                minute INTEGER
+            )
         """)
 
-# ================= AI =================
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                expire TIMESTAMP WITH TIME ZONE
+            )
+        """)
 
-async def train_ai(side, rank, suit, prev, minute, result):
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS codes (
+                code TEXT PRIMARY KEY,
+                days INTEGER,
+                used BOOLEAN DEFAULT FALSE,
+                type TEXT DEFAULT 'user'
+            )
+        """)
+
+# ────────────────────────────────────────────────
+# SUBSCRIPTION
+# ────────────────────────────────────────────────
+
+async def check_sub(user_id):
+    if user_id == ADMIN_ID or user_id in TRAINER_IDS:
+        return True
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT expire FROM users WHERE user_id=$1",
+            str(user_id)
+        )
+        if not row:
+            return False
+        return row["expire"] > datetime.now(tz=SAUDI_TZ)
+
+# ────────────────────────────────────────────────
+# AI
+# ────────────────────────────────────────────────
+
+async def train_ai(side, rank, suit, prev, result):
+    minute = datetime.now(tz=SAUDI_TZ).minute
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO training (side, rank, suit, prev, minute, result)
+            INSERT INTO training (side, rank, suit, prev, result, minute)
             VALUES ($1,$2,$3,$4,$5,$6)
-        """, side, rank, suit, prev, minute, result)
+        """, side, rank, suit, prev, result, minute)
 
-async def predict_ai(side, rank, suit, prev, minute):
+
+async def predict(side, rank, suit, prev, hands):
+    scores = {h: 0 for h in hands}
+    total = 0
+    minute = datetime.now(tz=SAUDI_TZ).minute
+
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT result FROM training WHERE side=$1 AND rank=$2 AND suit=$3 AND prev=$4 AND minute=$5",
-            side, rank, suit, prev, minute
-        )
+        rows = await conn.fetch("SELECT * FROM training WHERE side=$1", side)
 
-    if not rows:
-        return "لا يوجد بيانات", 0
-
-    counts = {}
     for r in rows:
-        counts[r["result"]] = counts.get(r["result"], 0) + 1
+        weight = 0
+        if r["rank"] == rank: weight += 3
+        if r["suit"] == suit: weight += 3
+        if r["prev"] == prev: weight += 5
+        if r["minute"] == minute: weight += 4
 
-    best = max(counts, key=counts.get)
-    confidence = int((counts[best] / len(rows)) * 100)
+        if weight > 0 and r["result"] in scores:
+            scores[r["result"]] += weight
+            total += weight
 
+    if total == 0:
+        return random.choice(hands), random.randint(30,60)
+
+    best = max(scores, key=scores.get)
+    confidence = int((scores[best]/total)*100)
     return best, confidence
 
-# ================= KEYBOARDS =================
+# ────────────────────────────────────────────────
+# KEYBOARDS
+# ────────────────────────────────────────────────
 
 def ranks_kb():
     ranks = ["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=r, callback_data=f"rank_{r}") for r in ranks[i:i+4]]
-            for i in range(0, len(ranks), 4)
-        ]
-    )
+    rows = [ranks[i:i+4] for i in range(0,len(ranks),4)]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=r,callback_data=f"rank_{r}") for r in row]
+        for row in rows
+    ])
 
 def suits_kb():
     suits = ["♥️","♦️","♣️","♠️"]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=s, callback_data=f"suit_{s}") for s in suits]]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=s,callback_data=f"suit_{s}") for s in suits]
+    ])
 
 def prev_kb():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=h, callback_data=f"prev_{h}")]
-                         for h in HANDS_LEFT]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=RIGHT_LABELS[h],callback_data=f"prev_{h}")]
+        for h in RIGHT_HANDS
+    ])
 
-# ================= BOT FLOW =================
+def next_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 تخمين جديد",callback_data="next")]
+    ])
+
+# ────────────────────────────────────────────────
+# HANDLERS
+# ────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    if not await check_sub(message.from_user.id):
+        await message.answer("❌ لازم كود اشتراك")
+        return
+
+    user_temp[message.from_user.id] = {}
     await message.answer("اختر رقم الورقة:", reply_markup=ranks_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("rank_"))
-async def choose_rank(callback: CallbackQuery):
-    user_state[callback.from_user.id] = {"rank": callback.data.split("_")[1]}
-    await callback.message.edit_text("اختر النوع:", reply_markup=suits_kb())
+async def rank_handler(c: CallbackQuery):
+    user_temp[c.from_user.id]["rank"] = c.data.split("_")[1]
+    await c.message.edit_text("اختر النوع:", reply_markup=suits_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("suit_"))
-async def choose_suit(callback: CallbackQuery):
-    user_state[callback.from_user.id]["suit"] = callback.data.split("_")[1]
-    await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_kb())
+async def suit_handler(c: CallbackQuery):
+    user_temp[c.from_user.id]["suit"] = c.data.split("_")[1]
+    await c.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("prev_"))
-async def predict(callback: CallbackQuery):
-    await callback.answer()
-    user_id = callback.from_user.id
-    data = user_state.get(user_id)
+async def prev_handler(c: CallbackQuery):
+    data = user_temp[c.from_user.id]
+    prev = c.data.split("_")[1]
 
-    if not data:
-        await callback.message.edit_text("اكتب /start من جديد")
-        return
+    left, l_conf = await predict("left",data["rank"],data["suit"],prev,LEFT_HANDS)
+    right, r_conf = await predict("right",data["rank"],data["suit"],prev,RIGHT_HANDS)
 
-    tz = pytz.timezone(TIMEZONE)
-    minute = datetime.now(tz).minute
-    prev = callback.data.replace("prev_", "")
+    await c.message.edit_text(
+        f"⬅️ {LEFT_LABELS[left]} ({l_conf}%)\n"
+        f"➡️ {RIGHT_LABELS[right]} ({r_conf}%)",
+        reply_markup=next_kb()
+    )
 
-    left, left_conf = await predict_ai("left", data["rank"], data["suit"], prev, minute)
-    right, right_conf = await predict_ai("right", data["rank"], data["suit"], prev, minute)
+@dp.callback_query(lambda c: c.data=="next")
+async def next_handler(c: CallbackQuery):
+    user_temp.pop(c.from_user.id,None)
+    await c.message.edit_text("ابدأ من جديد:", reply_markup=ranks_kb())
 
-    if user_id == ADMIN_ID:
-        await callback.message.edit_text(
-            f"يسار: {left} ({left_conf}%)\nيمين: {right} ({right_conf}%)\n\nارسل نتيجة اليسار"
-        )
-        user_state[user_id]["prev"] = prev
-        user_state[user_id]["minute"] = minute
-    else:
-        await callback.message.edit_text(
-            f"⬅️ يسار: {left} ({left_conf}%)\n➡️ يمين: {right} ({right_conf}%)"
-        )
-
-# ================= ADMIN TRAIN =================
-
-@dp.message()
-async def handle_training(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    if message.text in HANDS_LEFT:
-        data = user_state.get(message.from_user.id)
-        if not data:
-            return
-
-        await train_ai("left", data["rank"], data["suit"],
-                       data["prev"], data["minute"], message.text)
-
-        await message.answer("ارسل نتيجة اليمين")
-        user_state[message.from_user.id]["left_done"] = True
-
-    elif message.text in HANDS_RIGHT:
-        data = user_state.get(message.from_user.id)
-        if not data:
-            return
-
-        await train_ai("right", data["rank"], data["suit"],
-                       data["prev"], data["minute"], message.text)
-
-        await message.answer("تم تدريب الذكاء")
-        user_state.pop(message.from_user.id, None)
-
-# ================= MAIN =================
+# ────────────────────────────────────────────────
+# MAIN
+# ────────────────────────────────────────────────
 
 async def main():
     await init_db()
-    print("Bot is running...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
